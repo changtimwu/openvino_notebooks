@@ -1,4 +1,5 @@
 # Accelerate Inference of MobileNet V2 Image Classification Model with Post-Training Optimization Tool in OpenVINO™
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/openvinotoolkit/openvino_notebooks/HEAD?labpath=notebooks%2F113-image-classification-quantization%2F113-image-classification-quantization.ipynb)
 
 This tutorial demonstrates how to apply `INT8` quantization to the
 MobileNet V2 Image Classification model, using the 
@@ -16,3 +17,7 @@ The tutorial consists of the following steps:
 * Preparing the model for quantization.
 * Running optimization pipeline.
 * Comparing performance of the original and quantized models.
+
+## Installation Instructions
+
+If you have not installed all required dependencies, follow the [Installation Guide](../../README.md).

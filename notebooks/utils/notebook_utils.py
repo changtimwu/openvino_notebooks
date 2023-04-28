@@ -5,27 +5,21 @@
 
 
 import os
-import shutil
-import socket
+import requests
 import threading
 import time
-import urllib
 import urllib.parse
-import urllib.request
 from os import PathLike
 from pathlib import Path
-from typing import Callable, List, NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import cv2
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import openvino.inference_engine
-from async_pipeline import AsyncPipeline
-from IPython.display import HTML, Image, Markdown, clear_output, display
+from openvino.runtime import Core, get_version
+from IPython.display import HTML, Image, display
 from matplotlib.lines import Line2D
-from models import model
-from openvino.inference_engine import IECore
 from tqdm.notebook import tqdm_notebook
 
 
@@ -49,24 +43,12 @@ def load_image(path: str) -> np.ndarray:
     if path.startswith("http"):
         # Set User-Agent to Mozilla because some websites block
         # requests with User-Agent Python
-        request = urllib.request.Request(path, headers={"User-Agent": "Mozilla/5.0"})
-        response = urllib.request.urlopen(request)
-        array = np.asarray(bytearray(response.read()), dtype="uint8")
+        response = requests.get(path, headers={"User-Agent": "Mozilla/5.0"})
+        array = np.asarray(bytearray(response.content), dtype="uint8")
         image = cv2.imdecode(array, -1)  # Loads the image as BGR
     else:
         image = cv2.imread(path)
     return image
-
-
-class DownloadProgressBar(tqdm_notebook):
-    """
-    TQDM Progress bar for downloading files with urllib.request.urlretrieve
-    """
-
-    def update_to(self, block_num: int, block_size: int, total_size: int):
-        downloaded = block_num * block_size
-        if downloaded <= total_size:
-            self.update(downloaded - self.n)
 
 
 def download_file(
@@ -92,25 +74,8 @@ def download_file(
     :param timeout: Number of seconds before cancelling the connection attempt
     :return: path to downloaded file
     """
-    try:
-        opener = urllib.request.build_opener()
-        opener.addheaders = [("User-agent", "Mozilla/5.0")]
-        urllib.request.install_opener(opener)
-        urlobject = urllib.request.urlopen(url, timeout=timeout)
-        if filename is None:
-            filename = urlobject.info().get_filename() or Path(urllib.parse.urlparse(url).path).name
-    except urllib.error.HTTPError as e:
-        raise Exception(f"File downloading failed with error: {e.code} {e.msg}") from None
-    except urllib.error.URLError as error:
-        if isinstance(error.reason, socket.timeout):
-            raise Exception(
-                "Connection timed out. If you access the internet through a proxy server, please "
-                "make sure the proxy is set in the shell from where you launched Jupyter. If your "
-                "internet connection is slow, you can call `download_file(url, timeout=30)` to "
-                "wait for 30 seconds before raising this error."
-            ) from None
-        else:
-            raise
+    filename = filename or Path(urllib.parse.urlparse(url).path).name
+    chunk_size = 16384  # make chunks bigger so that not too many updates are triggered for Jupyter front-end
 
     filename = Path(filename)
     if len(filename.parts) > 1:
@@ -124,25 +89,46 @@ def download_file(
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         filename = directory / Path(filename)
+    
+    try:
+        response = requests.get(url=url, 
+                                headers={"User-agent": "Mozilla/5.0"}, 
+                                stream=True)
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as error:  # For error associated with not-200 codes. Will output something like: "404 Client Error: Not Found for url: {url}"
+        raise Exception(error) from None
+    except requests.exceptions.Timeout:
+        raise Exception(
+                "Connection timed out. If you access the internet through a proxy server, please "
+                "make sure the proxy is set in the shell from where you launched Jupyter."
+        ) from None
+    except requests.exceptions.RequestException as error:
+        raise Exception(f"File downloading failed with error: {error}") from None
 
     # download the file if it does not exist, or if it exists with an incorrect file size
-    urlobject_size = int(urlobject.info().get("Content-Length", 0))
-    if not filename.exists() or (os.stat(filename).st_size != urlobject_size):
-        progress_callback = DownloadProgressBar(
-            total=urlobject_size,
+    filesize = int(response.headers.get("Content-length", 0))
+    if not filename.exists() or (os.stat(filename).st_size != filesize):
+
+        with tqdm_notebook(
+            total=filesize,
             unit="B",
             unit_scale=True,
             unit_divisor=1024,
             desc=str(filename),
             disable=not show_progress,
-        )
-        urllib.request.urlretrieve(url, filename, reporthook=progress_callback.update_to)
-        if os.stat(filename).st_size >= urlobject_size:
-            progress_callback.update(urlobject_size - progress_callback.n)
-            progress_callback.refresh()
+        ) as progress_bar:
+            
+            with open(filename, "wb") as file_object:
+                for chunk in response.iter_content(chunk_size):
+                    file_object.write(chunk)
+                    progress_bar.update(len(chunk))
+                    progress_bar.refresh()
     else:
         if not silent:
             print(f"'{filename}' already exists.")
+    
+    response.close()
+    
     return filename.resolve()
 
 
@@ -525,7 +511,7 @@ def viz_result_image(
 # In[ ]:
 
 
-def showarray(frame: np.ndarray, display_handle=None):
+def show_array(frame: np.ndarray, display_handle=None):
     """
     Display array `frame`. Replace information at `display_handle` with `frame`
     encoded as jpeg image. `frame` is expected to have data in BGR order.
@@ -538,137 +524,6 @@ def showarray(frame: np.ndarray, display_handle=None):
     else:
         display_handle.update(Image(data=frame.tobytes()))
     return display_handle
-
-
-def show_live_inference(
-    ie, image_paths: List, model: model.Model, device: str, reader: Optional[Callable] = None
-):
-    """
-    Do inference of images listed in `image_paths` on `model` on the given `device` and show
-    the results in real time in a Jupyter Notebook
-
-    :param image_paths: List of image filenames to load
-    :param model: Model instance for inference
-    :param device: Name of device to perform inference on. For example: "CPU"
-    :param reader: Image reader. Should return a numpy array with image data.
-                   If None, cv2.imread will be used, with the cv2.IMREAD_UNCHANGED flag
-    """
-    display_handle = None
-    next_frame_id = 0
-    next_frame_id_to_show = 0
-
-    input_layer = next(iter(model.net.input_info))
-
-    # Create asynchronous pipeline and print time it takes to load the model
-    load_start_time = time.perf_counter()
-    pipeline = AsyncPipeline(
-        ie=ie, model=model, plugin_config={}, device=device, max_num_requests=0
-    )
-    load_end_time = time.perf_counter()
-
-    # Perform asynchronous inference
-    start_time = time.perf_counter()
-
-    while next_frame_id < len(image_paths) - 1:
-        results = pipeline.get_result(next_frame_id_to_show)
-
-        if results:
-            # Show next result from async pipeline
-            result, meta = results
-            display_handle = showarray(result, display_handle)
-            next_frame_id_to_show += 1
-        if pipeline.is_ready():
-            # Submit new image to async pipeline
-            image_path = image_paths[next_frame_id]
-            if reader is None:
-                image = cv2.imread(filename=str(image_path), flags=cv2.IMREAD_UNCHANGED)
-            else:
-                image = reader(str(image_path))
-            pipeline.submit_data(
-                inputs={input_layer: image}, id=next_frame_id, meta={"frame": image}
-            )
-            del image
-            next_frame_id += 1
-        else:
-            # If the pipeline is not ready yet and there are no results: wait
-            pipeline.await_any()
-
-    pipeline.await_all()
-
-    # Show all frames that are in the pipeline after all images have been submitted
-    while pipeline.has_completed_request():
-        results = pipeline.get_result(next_frame_id_to_show)
-        if results:
-            result, meta = results
-            display_handle = showarray(result, display_handle)
-            next_frame_id_to_show += 1
-
-    end_time = time.perf_counter()
-    duration = end_time - start_time
-    fps = len(image_paths) / duration
-    print(f"Loaded model to {device} in {load_end_time-load_start_time:.2f} seconds.")
-    print(f"Total time for {next_frame_id} frames: {duration:.2f} seconds, fps:{fps:.2f}")
-
-    del pipeline.exec_net
-    del pipeline
-
-
-# ## OpenVINO Tools
-
-# In[ ]:
-
-
-def benchmark_model(
-    model_path: PathLike,
-    device: str = "CPU",
-    seconds: int = 60,
-    api: str = "async",
-    batch: int = 1,
-    cache_dir: PathLike = "model_cache",
-):
-    """
-    Benchmark model `model_path` with `benchmark_app`. Returns the output of `benchmark_app`
-    without logging info, and information about the device
-
-    :param model_path: path to IR model xml file, or ONNX model
-    :param device: device to benchmark on. For example, "CPU" or "MULTI:CPU,GPU"
-    :param seconds: number of seconds to run benchmark_app
-    :param api: API. Possible options: sync or async
-    :param batch: Batch size
-    :param cache_dir: Directory that contains model/kernel cache files
-    """
-    ie = IECore()
-    model_path = Path(model_path)
-    if ("GPU" in device) and ("GPU" not in ie.available_devices):
-        raise ValueError(
-            f"A GPU device is not available. Available devices are: {ie.available_devices}"
-        )
-    else:
-        benchmark_command = f"benchmark_app -m {model_path} -d {device} -t {seconds} -api {api} -b {batch} -cdir {cache_dir}"
-        display(
-            Markdown(
-                f"**Benchmark {model_path.name} with {device} for {seconds} seconds with {api} inference**"
-            )
-        )
-        display(Markdown(f"Benchmark command: `{benchmark_command}`"))
-
-        benchmark_output = get_ipython().run_line_magic("sx", "$benchmark_command")
-        benchmark_result = [
-            line
-            for line in benchmark_output
-            if not (line.startswith(r"[") or line.startswith("      ") or line == "")
-        ]
-        print("\n".join(benchmark_result))
-        print()
-        if "MULTI" in device:
-            devices = device.replace("MULTI:", "").split(",")
-            for single_device in devices:
-                device_name = ie.get_metric(
-                    device_name=single_device, metric_name="FULL_DEVICE_NAME"
-                )
-                print(f"{single_device} device: {device_name}")
-        else:
-            print(f"Device: {ie.get_metric(device_name=device, metric_name='FULL_DEVICE_NAME')}")
 
 
 # ## Checks and Alerts
@@ -705,7 +560,7 @@ class DeviceNotFoundAlert(NotebookAlert):
         :return: A formatted alert box with the message that `device` is not available, and a list
                  of devices that are available.
         """
-        ie = IECore()
+        ie = Core()
         supported_devices = ie.available_devices
         self.message = (
             f"Running this cell requires a {device} device, "
@@ -729,7 +584,7 @@ def check_device(device: str) -> bool:
     :return: True if the device is available, False if not. If the device is not available,
              a DeviceNotFoundAlert will be shown.
     """
-    ie = IECore()
+    ie = Core()
     if device not in ie.available_devices:
         DeviceNotFoundAlert(device)
         return False
@@ -745,7 +600,7 @@ def check_openvino_version(version: str) -> bool:
     :return: True if the version is installed, False if not. If the version is not installed,
              an alert message will be shown.
     """
-    installed_version = openvino.inference_engine.get_version()
+    installed_version = get_version()
     if version not in installed_version:
         NotebookAlert(
             f"This notebook requires OpenVINO {version}. "

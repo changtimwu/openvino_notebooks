@@ -1,4 +1,5 @@
 # Interactive Machine Translation with OpenVino
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/openvinotoolkit/openvino_notebooks/HEAD?labpath=notebooks%2F221-machine-translation%2F221-machine-translation.ipynb)
 
 Machine translation is a form of natural language processing that translates sentences from one language to another.
 
@@ -11,4 +12,4 @@ The last cell is interactive, so you can type sentences in English that will be 
 
 ## Installation Instructions
 
-To install all dependencies, please follow the [official guide](../../README.md).
+If you have not installed all required dependencies, follow the [Installation Guide](../../README.md).
